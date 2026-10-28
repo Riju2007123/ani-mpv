@@ -8,7 +8,6 @@ An Android app for watching anime, reading manga, and streaming videos with mpv.
 - **Manga Reader**: Browse and read manga with Comick search, genre filters, and chapter page viewer.
 - **Fast Downloader**: Parallel HLS segment downloading with automatic retry.
 - **MPV Player**: Hardware-accelerated video playback with custom controls, skip OP/ED buttons, and background playback.
-- **Web App**: Companion web interface hosted on GitHub Pages.
 
 ## Download
 
