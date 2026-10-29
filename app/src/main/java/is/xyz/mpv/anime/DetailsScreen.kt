@@ -1,7 +1,9 @@
 package `is`.xyz.mpv.anime
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -16,10 +18,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -44,6 +48,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -58,19 +63,16 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import kotlinx.coroutines.launch
-import java.util.Locale
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DetailsScreen(
     viewModel: DetailsViewModel,
     slug: String,
     onBack: () -> Unit,
 ) {
-    LaunchedEffect(slug) { viewModel.load(slug) }
-
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -79,6 +81,43 @@ fun DetailsScreen(
     var downloadEpisode by remember { mutableStateOf<Episode?>(null) }
     var preparingDownload by remember { mutableStateOf<String?>(null) }
     var pendingError by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(slug) {
+        viewModel.load(slug)
+    }
+
+    downloadEpisode?.let { target ->
+        val details = (viewModel.state as? DetailsUiState.Content)?.details
+        if (details != null) {
+            QualityDialog(
+                episodeNumber = target.number,
+                onDismiss = { downloadEpisode = null },
+                onSelect = { quality ->
+                    downloadEpisode = null
+                    preparingDownload = target.id
+                    scope.launch {
+                        try {
+                            val stream = viewModel.resolve(target.id)
+                            DownloadService.enqueue(
+                                context = context,
+                                details = details,
+                                episode = target,
+                                mode = viewModel.mode,
+                                quality = quality,
+                                stream = stream,
+                            )
+                            Library.rememberEpisode(details, target, viewModel.mode)
+                            pendingError = "Downloading episode ${target.number} in ${quality}p"
+                        } catch (t: Throwable) {
+                            pendingError = t.userMessage()
+                        } finally {
+                            preparingDownload = null
+                        }
+                    }
+                },
+            )
+        }
+    }
 
     LaunchedEffect(pendingError) {
         pendingError?.let {
@@ -139,39 +178,6 @@ fun DetailsScreen(
             )
         }
 
-        val content = viewModel.state as? DetailsUiState.Content
-        val target = downloadEpisode
-        if (content != null && target != null) {
-            val details = content.details
-            QualityDialog(
-                episodeNumber = target.number,
-                onDismiss = { downloadEpisode = null },
-                onSelect = { quality ->
-                    downloadEpisode = null
-                    preparingDownload = target.id
-                    scope.launch {
-                        try {
-                            val stream = viewModel.resolve(target.id)
-                            DownloadService.enqueue(
-                                context = context,
-                                details = details,
-                                episode = target,
-                                mode = viewModel.mode,
-                                quality = quality,
-                                stream = stream,
-                            )
-                            Library.rememberEpisode(details, target, viewModel.mode)
-                            pendingError = "Downloading episode ${target.number} in ${quality}p"
-                        } catch (t: Throwable) {
-                            pendingError = t.userMessage()
-                        } finally {
-                            preparingDownload = null
-                        }
-                    }
-                },
-            )
-        }
-
         SnackbarHost(
             hostState = snackbarHostState,
             modifier = Modifier
@@ -197,6 +203,18 @@ private fun DetailsContent(
 ) {
     var expanded by remember(details.slug) { mutableStateOf(false) }
     val bookmarked = Library.isBookmarked(details.slug)
+
+    var selectedRangeIndex by remember { mutableIntStateOf(0) }
+    val ranges = remember(episodes.size) {
+        val chunks = mutableListOf<Pair<Int, Int>>()
+        var start = 1
+        while (start <= episodes.size) {
+            val end = (start + 99).coerceAtMost(episodes.size)
+            chunks.add(start to end)
+            start += 100
+        }
+        chunks
+    }
 
     LazyVerticalGrid(
         columns = GridCells.Adaptive(84.dp),
@@ -262,7 +280,7 @@ private fun DetailsContent(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 SectionTitle(
-                    text = "Episodes",
+                    text = "Episodes (${episodes.size})",
                     modifier = Modifier.weight(1f),
                 )
                 if (details.dubCount > 0) {
@@ -281,18 +299,58 @@ private fun DetailsContent(
             }
         }
 
-        items(episodes, key = { it.id }) { episode ->
-            val download = Library.state.downloads.firstOrNull {
-                it.episodeId == episode.id && it.mode == mode
+        // 100-Episode Range Chunks for Long Anime (e.g. One Piece, Naruto, Bleach)
+        if (episodes.size > 100) {
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                LazyRow(
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    itemsIndexed(ranges) { index, (start, end) ->
+                        val isSelected = index == selectedRangeIndex
+                        FilterChip(
+                            selected = isSelected,
+                            onClick = { selectedRangeIndex = index },
+                            label = { Text("$start - $end") },
+                        )
+                    }
+                }
             }
-            EpisodeCell(
-                episode = episode,
-                loading = resolvingEpisode == episode.id,
-                download = download,
-                preparing = preparingDownload == episode.id,
-                onClick = { onEpisodeClick(episode) },
-                onDownloadClick = { onDownloadClick(episode) },
-            )
+
+            val (startEp, endEp) = ranges.getOrNull(selectedRangeIndex) ?: (1 to episodes.size)
+            val filteredEpisodes = episodes.filter { ep ->
+                val num = ep.number.toIntOrNull() ?: 0
+                num in startEp..endEp
+            }.ifEmpty { episodes.subList((startEp - 1).coerceAtLeast(0), endEp.coerceAtMost(episodes.size)) }
+
+            items(filteredEpisodes, key = { it.id }) { episode ->
+                val download = Library.state.downloads.firstOrNull {
+                    it.episodeId == episode.id && it.mode == mode
+                }
+                EpisodeCell(
+                    episode = episode,
+                    loading = resolvingEpisode == episode.id,
+                    download = download,
+                    preparing = preparingDownload == episode.id,
+                    onClick = { onEpisodeClick(episode) },
+                    onDownloadClick = { onDownloadClick(episode) },
+                )
+            }
+        } else {
+            items(episodes, key = { it.id }) { episode ->
+                val download = Library.state.downloads.firstOrNull {
+                    it.episodeId == episode.id && it.mode == mode
+                }
+                EpisodeCell(
+                    episode = episode,
+                    loading = resolvingEpisode == episode.id,
+                    download = download,
+                    preparing = preparingDownload == episode.id,
+                    onClick = { onEpisodeClick(episode) },
+                    onDownloadClick = { onDownloadClick(episode) },
+                )
+            }
         }
     }
 }
@@ -351,74 +409,55 @@ private fun Header(
             contentDescription = details.title,
             contentScale = ContentScale.Crop,
             modifier = Modifier
-                .width(108.dp)
+                .width(112.dp)
                 .aspectRatio(2f / 3f)
                 .clip(RoundedCornerShape(14.dp)),
         )
-        Spacer(Modifier.width(14.dp))
+        Spacer(Modifier.width(16.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = details.title,
-                style = MaterialTheme.typography.headlineSmall,
+                style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
-                maxLines = 3,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
             Spacer(Modifier.height(8.dp))
             Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                details.score?.let { ScoreBadge(it) }
+                details.score?.let { score ->
+                    Icon(
+                        imageVector = Icons.Filled.Star,
+                        contentDescription = "Score",
+                        tint = DubAmber,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Text(
+                        text = "%.1f".format(score / 10f),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                }
                 details.format?.let { Pill(it) }
                 details.year?.let { Pill(it.toString()) }
             }
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = "${episodes.size} episodes",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (details.subCount > 0 || details.dubCount > 0) {
-                Spacer(Modifier.height(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (details.subCount > 0) Tag("SUB ${details.subCount}", SubCyan)
-                    if (details.dubCount > 0) Tag("DUB ${details.dubCount}", DubAmber)
-                }
+            Spacer(Modifier.height(10.dp))
+            IconButton(
+                onClick = onBookmarkClick,
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .background(if (bookmarked) AccentPink else MaterialTheme.colorScheme.surfaceVariant),
+            ) {
+                Icon(
+                    imageVector = if (bookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
+                    contentDescription = "Bookmark",
+                    tint = if (bookmarked) Color.White else MaterialTheme.colorScheme.onSurface,
+                )
             }
         }
-        IconButton(onClick = onBookmarkClick) {
-            Icon(
-                imageVector = if (bookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
-                contentDescription = if (bookmarked) "Remove from watchlist" else "Add to watchlist",
-                tint = if (bookmarked) AccentPink else MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-}
-
-@Composable
-private fun ScoreBadge(score: Int) {
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
-            .background(Color(0x3322D3EE))
-            .padding(horizontal = 7.dp, vertical = 3.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            imageVector = Icons.Filled.Star,
-            contentDescription = null,
-            tint = Color(0xFFFFC94D),
-            modifier = Modifier.size(14.dp),
-        )
-        Spacer(Modifier.width(3.dp))
-        Text(
-            text = String.format(Locale.US, "%.1f", score / 10.0),
-            style = MaterialTheme.typography.labelMedium,
-            fontWeight = FontWeight.Bold,
-            color = Color(0xFF8FE9F7),
-        )
     }
 }
 
@@ -454,6 +493,7 @@ private fun GenreChip(text: String) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun EpisodeCell(
     episode: Episode,
@@ -463,16 +503,18 @@ private fun EpisodeCell(
     onClick: () -> Unit,
     onDownloadClick: () -> Unit,
 ) {
-    Row(
+    Box(
         modifier = Modifier
             .padding(4.dp)
             .fillMaxWidth()
-            .height(48.dp)
-            .clip(RoundedCornerShape(10.dp))
+            .height(52.dp)
+            .clip(RoundedCornerShape(12.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
-            .clickable(enabled = !loading) { onClick() },
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically,
+            .combinedClickable(
+                onClick = { if (!loading) onClick() },
+                onLongClick = { if (!preparing) onDownloadClick() },
+            ),
+        contentAlignment = Alignment.Center,
     ) {
         if (loading) {
             CircularProgressIndicator(
@@ -481,21 +523,32 @@ private fun EpisodeCell(
                 color = AccentPink,
             )
         } else {
-            Text(
-                text = episode.number,
-                style = MaterialTheme.typography.labelLarge,
-            )
-            Spacer(Modifier.width(2.dp))
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Text(
+                    text = episode.number,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                )
+            }
+
+            // Download Status Badge at Top-Right Corner
             Box(
                 modifier = Modifier
-                    .size(24.dp)
+                    .align(Alignment.TopEnd)
+                    .padding(4.dp)
+                    .size(20.dp)
                     .clip(CircleShape)
+                    .background(Color(0x44000000))
                     .clickable(enabled = !preparing) { onDownloadClick() },
                 contentAlignment = Alignment.Center,
             ) {
                 when {
                     preparing -> CircularProgressIndicator(
-                        modifier = Modifier.size(12.dp),
+                        modifier = Modifier.size(10.dp),
                         strokeWidth = 1.5.dp,
                         color = AccentPink,
                     )
@@ -504,12 +557,12 @@ private fun EpisodeCell(
                         imageVector = Icons.Filled.DownloadDone,
                         contentDescription = "Downloaded",
                         tint = SubCyan,
-                        modifier = Modifier.size(15.dp),
+                        modifier = Modifier.size(12.dp),
                     )
 
                     download?.isActive == true -> CircularProgressIndicator(
                         progress = { (download?.progress ?: 0) / 100f },
-                        modifier = Modifier.size(13.dp),
+                        modifier = Modifier.size(10.dp),
                         strokeWidth = 1.5.dp,
                         color = AccentPink,
                     )
@@ -517,8 +570,8 @@ private fun EpisodeCell(
                     else -> Icon(
                         imageVector = Icons.Filled.Download,
                         contentDescription = "Download episode",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(15.dp),
+                        tint = Color(0xAA8888AA),
+                        modifier = Modifier.size(11.dp),
                     )
                 }
             }
@@ -534,42 +587,24 @@ private fun QualityDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Download episode $episodeNumber") },
-        text = {
-            Column {
-                Text(
-                    text = "Choose a quality. Higher looks better and uses more storage.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(12.dp))
-                listOf(
-                    480 to "480p · small",
-                    720 to "720p · balanced",
-                    1080 to "1080p · best",
-                ).forEach { (quality, label) ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .clickable { onSelect(quality) }
-                            .padding(horizontal = 8.dp, vertical = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+        title = { Text("Download Episode $episodeNumber") },
+        text = { Text("Choose quality:") },
+        confirmButton = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                listOf(1080, 720, 480, 360).forEach { quality ->
+                    TextButton(
+                        onClick = { onSelect(quality) },
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Icon(
-                            imageVector = Icons.Filled.Download,
-                            contentDescription = null,
-                            tint = AccentPink,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Spacer(Modifier.width(10.dp))
-                        Text(label, style = MaterialTheme.typography.bodyLarge)
+                        Text("${quality}p", color = AccentPink)
                     }
                 }
             }
         },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         },
     )
 }
